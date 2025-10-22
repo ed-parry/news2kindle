@@ -31,7 +31,7 @@ KINDLE_EMAIL = os.getenv("KINDLE_EMAIL")
 PANDOC = os.getenv("PANDOC_PATH", "/usr/bin/pandoc")
 PERIOD = int(os.getenv("UPDATE_PERIOD", 12))  # hours between RSS pulls
 
-CONFIG_PATH = '/config'
+CONFIG_PATH = '/app/config'
 FEED_FILE = os.path.join(CONFIG_PATH, 'feeds.txt')
 COVER_FILE = os.path.join(CONFIG_PATH, 'cover.png')
 
@@ -62,7 +62,9 @@ def get_start(fname):
     Get the starting time to read posts since. This is currently saved as 
     the timestamp of the feeds file.
     """
-    return pytz.utc.localize(datetime.fromtimestamp(os.path.getmtime(fname)))
+    return pytz.utc.localize(
+        datetime.fromtimestamp(os.path.getmtime(fname)) - timedelta(hours=24)
+    )
 
 
 def get_posts_list(feed_list, START):
