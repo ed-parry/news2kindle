@@ -1,11 +1,25 @@
-FROM python:3.8-buster
+# Move off EOL Debian Buster; use current Debian
+FROM python:3.12-bookworm
 
-COPY requirements.txt requirements.txt
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
+WORKDIR /app
+
+# Install OS packages first; clean apt metadata
 RUN apt-get update \
-    && apt-get install -y pandoc calibre \
-    && pip3 install -r requirements.txt
+ && apt-get install -y --no-install-recommends \
+      pandoc \
+      calibre \
+ && rm -rf /var/lib/apt/lists/*
 
+# Leverage layer caching: install Python deps before copying source
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# Copy application code
 COPY src/ src/
 COPY config/ config/
 
