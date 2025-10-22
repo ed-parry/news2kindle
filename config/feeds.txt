@@ -1,2 +1,1 @@
-https://hackernoon.com/tagged/ai/feed
-https://hackernoon.com/tagged/big-data/feed
+https://feeds.bbci.co.uk/news/rss.xml
