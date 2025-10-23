@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+# Daily EPUB generator with ChatGPT-written summary (weather + agenda + top UK headlines),
+# Kindle-safe HTML, and email delivery via Gmail SMTP (STARTTLS).
+
 from email.utils import COMMASPACE, formatdate, formataddr
 from email.header import Header
 from email.mime.text import MIMEText
@@ -17,9 +20,13 @@ import os
 import re
 import tempfile
 import html
+import json
 from pathlib import Path
 from shutil import which
 import requests
+from openai import OpenAI
+from icalendar import Calendar
+from dateutil.tz import gettz
 from FeedparserThread import FeedparserThread
 
 logging.basicConfig(level=logging.INFO)
@@ -32,22 +39,28 @@ EMAIL_PASSWD = os.getenv("EMAIL_PASSWORD")
 EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_USER)
 KINDLE_EMAIL = os.getenv("KINDLE_EMAIL")
 PANDOC = os.getenv("PANDOC_PATH", "/usr/bin/pandoc")
-PERIOD = int(os.getenv("UPDATE_PERIOD", 12))  # hours between RSS pulls
+PERIOD = int(os.getenv("UPDATE_PERIOD", 12))  # minutes between runs (12 => 12 minutes). Adjust if you intend hours.
 
-DOC_TITLE = "Today's headlines"
-DOC_AUTHOR = "22nd October 2025"
+DOC_TITLE = os.getenv("DOC_TITLE", "Daily News")
+DOC_AUTHOR = os.getenv("DOC_AUTHOR", "News2Kindle")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Paths
 CONFIG_PATH = Path("/app/config")
 FEED_FILE = CONFIG_PATH / "feeds.txt"
-COVER_FILE = CONFIG_PATH / "cover.png"  # optional; currently unused
+CAL_FILE = CONFIG_PATH / "calendars.txt"  # list of secret iCal URLs, one per line
+
+# Timezone
+LONDON_TZ = gettz("Europe/London")
 
 # HTML templates
-HTML_HEAD = u"""<!doctype html>
+HTML_HEAD_TEMPLATE = u"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>{doc_title}</title>
+  <title>{DOC_TITLE}</title>
   <style>
     body { font-family: serif; line-height: 1.4; }
     h1,h2,h3 { margin-top: 1.2em; }
@@ -55,17 +68,13 @@ HTML_HEAD = u"""<!doctype html>
     .muted { color: #555; }
     ol.headlines { padding-left: 1.2em; }
     ol.headlines li { margin: 0.4em 0; }
-    /* Weather card */
-    .weather-card { display: table; width: 100%; }
-    .weather-left { display: table-cell; width: 3.5em; vertical-align: middle; text-align: center; }
-    .weather-right { display: table-cell; vertical-align: middle; padding-left: 0.8em; }
-    .wx-icon { font-size: 300%; line-height: 1; }
-    .wx-summary { font-weight: bold; margin: 0 0 0.2em 0; }
-    .wx-meta { margin: 0.1em 0; }
+    /* Article layout */
+    article { margin: 1em 0; }
   </style>
 </head>
 <body>
-""".format(doc_title=html.escape(DOC_TITLE))
+"""
+HTML_HEAD = HTML_HEAD_TEMPLATE.replace("{DOC_TITLE}", html.escape(DOC_TITLE))
 
 HTML_TAIL = u"""
 </body>
@@ -85,7 +94,7 @@ BAD_TAGS_RE = re.compile(r"</?(script|style|iframe|svg|object|embed|noscript|vid
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 
-# Cardiff, UK constants (Europe/London)
+# Weather (Open-Meteo)
 LAT, LON = 51.4816, -3.1791
 OPEN_METEO = (
     "https://api.open-meteo.com/v1/forecast"
@@ -125,29 +134,17 @@ WEATHERCODE = {
     99: "Thunderstorm with heavy hail",
 }
 
-def weather_icon(code: int) -> str:
-    # Plain Unicode glyphs that render on Kindle
-    if code in (0,):
-        return "☀︎"
-    if code in (1, 2):
-        return "☀︎"  # avoid emoji fonts on some Kindles
-    if code in (3,):
-        return "☁︎"
-    if code in (45, 48):
-        return "〰"
-    if code in (51, 53, 55, 56, 57):
-        return "☂︎"
-    if code in (61, 63, 65, 66, 67, 80, 81, 82):
-        return "☂︎"
-    if code in (71, 73, 75, 77, 85, 86):
-        return "❄︎"
-    if code in (95, 96, 99):
-        return "⚡︎"
-    return "☁︎"
+
+# ----------------------------
+# Feeds
+# ----------------------------
 
 def load_feeds():
+    if not FEED_FILE.exists():
+        return []
     with open(FEED_FILE, "r", encoding="utf-8") as f:
-        return list(f)
+        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+
 
 def update_start(now):
     new_now = time.mktime(now.timetuple())
@@ -155,10 +152,15 @@ def update_start(now):
     with open(FEED_FILE, "a", encoding="utf-8"):
         os.utime(FEED_FILE, (new_now, new_now))
 
+
 def get_start(fname: Path):
+    if not fname.exists():
+        # default to 24h ago if no file yet
+        return pytz.utc.localize(datetime.utcnow() - timedelta(hours=24))
     return pytz.utc.localize(
         datetime.fromtimestamp(os.path.getmtime(fname)) - timedelta(hours=24)
     )
+
 
 def get_posts_list(feed_list, start_dt):
     posts = []
@@ -171,11 +173,14 @@ def get_posts_list(feed_list, start_dt):
         th.join()
     return posts
 
+
 def nicedate(dt):
     return dt.strftime("%d %B %Y").strip("0")
 
+
 def nicehour(dt):
     return dt.strftime("%I:%M %p").strip("0").lower()
+
 
 def sanitise_fragment(html_text: str) -> str:
     """Clean feed content fragments; safe to inject inside <body>. Do not use on full document."""
@@ -183,6 +188,7 @@ def sanitise_fragment(html_text: str) -> str:
     html_text = BAD_TAGS_RE.sub("", html_text)
     html_text = IMG_TAG_RE.sub("", html_text)
     return html_text
+
 
 def nicepost(post, idx):
     d = post._asdict()
@@ -195,6 +201,7 @@ def nicepost(post, idx):
     d["body"] = sanitise_fragment(d.get("body") or "")
     return d
 
+
 def html_to_text_one_sentence(html_text: str, max_chars: int = 220) -> str:
     t = TAG_RE.sub(" ", html_text)
     t = html.unescape(t)
@@ -205,24 +212,74 @@ def html_to_text_one_sentence(html_text: str, max_chars: int = 220) -> str:
         s = s[: max_chars - 1].rstrip() + "…"
     return s
 
-def build_headlines_section(posts):
-    items = []
-    for i, post in enumerate(posts, start=1):
-        p = post._asdict()
-        title = html.escape(p.get("title") or "Untitled")
-        excerpt = html_to_text_one_sentence(p.get("body") or "")
-        items.append(
-            f'<li><a href="#post-{i}">{title}</a><br>'
-            f'<span class="muted">{html.escape(excerpt)}</span></li>'
-        )
-    return (
-        "<h1>Today’s headlines</h1>"
-        '<div class="k-card"><ol class="headlines">'
-        + "\n".join(items)
-        + "</ol></div>"
-    )
 
-def fetch_cardiff_weather_html() -> str:
+# ----------------------------
+# Calendar (ICS without OAuth)
+# ----------------------------
+
+def load_calendar_urls():
+    if not CAL_FILE.exists():
+        return []
+    with open(CAL_FILE, "r", encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _to_dt_local(v):
+    if hasattr(v, "hour"):
+        dt = v
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        return dt.astimezone(LONDON_TZ)
+    return datetime(v.year, v.month, v.day, 0, 0, tzinfo=LONDON_TZ)
+
+
+def _is_today_local(dt):
+    return dt.date() == datetime.now(LONDON_TZ).date()
+
+
+def fetch_todays_events_struct():
+    urls = load_calendar_urls()
+    events = []
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            cal = Calendar.from_ical(r.content)
+            for comp in cal.walk("VEVENT"):
+                start = comp.decoded("DTSTART")
+                end = comp.decoded("DTEND", None)
+                dt_start = _to_dt_local(start)
+                if not _is_today_local(dt_start):
+                    continue
+                dt_end = _to_dt_local(end) if end is not None else None
+                title = str(comp.get("SUMMARY", "Untitled"))
+                if (title == "Calendar block"):
+                    continue
+                loc = str(comp.get("LOCATION", "")).strip()
+                all_day = not hasattr(start, "hour")
+                events.append({
+                    "start": "All day" if all_day else dt_start.strftime("%H:%M"),
+                    "end": (dt_end.strftime("%H:%M") if (dt_end and not all_day and dt_end.date()==dt_start.date()) else None),
+                    "title": title,
+                    "location": loc or None,
+                    "all_day": all_day,
+                })
+        except Exception:
+            continue
+    # Order: all-day first, then by time
+    def sort_key(e):
+        if e["all_day"]:
+            return ("", "")  # all-day first
+        return (e["start"], e["end"] or "")
+    events.sort(key=sort_key)
+    return events
+
+
+# ----------------------------
+# Weather (data for model)
+# ----------------------------
+
+def fetch_cardiff_weather_data():
     url = OPEN_METEO.format(lat=LAT, lon=LON)
     try:
         r = requests.get(url, timeout=10)
@@ -231,40 +288,96 @@ def fetch_cardiff_weather_html() -> str:
         d = data["daily"]
         today_str = date.today().isoformat()
         idx = d["time"].index(today_str)
-
         code = int(d["weathercode"][idx])
-        icon = weather_icon(code)
-        desc = WEATHERCODE.get(code, "Weather")
-
-        tmax = round(d["temperature_2m_max"][idx])
-        tmin = round(d["temperature_2m_min"][idx])
-        rain = round(d["precipitation_sum"][idx], 1)
-        wind = d.get("windspeed_10m_max", [None])[idx]
-        wind_txt = f"{round(wind)} km/h" if wind is not None else "—"
-
-        summary = f"{desc} · max {tmax}°C · min {tmin}°C"
-        meta1 = f"Rain {rain} mm"
-        meta2 = f"Wind {wind_txt}"
-
-        return (
-            "<h1>Personal summary</h1>"
-            '<div class="k-card weather-card">'
-            f'  <div class="weather-left"><span class="wx-icon">{icon}</span></div>'
-            '  <div class="weather-right">'
-            '    <p class="wx-summary">Cardiff today</p>'
-            f'    <p class="wx-meta">{html.escape(summary)}</p>'
-            f'    <p class="wx-meta">{html.escape(meta1)} · {html.escape(meta2)}</p>'
-            '  </div>'
-            '</div>'
-        )
+        return {
+            "description": WEATHERCODE.get(code, "Weather"),
+            "code": code,
+            "tmax_c": round(d["temperature_2m_max"][idx]),
+            "tmin_c": round(d["temperature_2m_min"][idx]),
+            "rain_mm": round(d["precipitation_sum"][idx], 1),
+            "wind_kmh": (round(d.get("windspeed_10m_max", [None])[idx])
+                         if d.get("windspeed_10m_max") else None),
+        }
     except Exception:
-        return (
-            "<h1>Personal summary</h1>"
-            '<div class="k-card"><p>Weather unavailable.</p></div>'
-        )
+        return None
+
+
+# ----------------------------
+# ChatGPT daily summary (weather + agenda + top 3 UK headlines)
+# ----------------------------
+
+def build_chatgpt_summary_html(weather, events):
+    """
+    Conversational two-paragraph summary fragment (no headings/lists).
+    Kindle-safe: only <p> tags.
+    """
+    if not OPENAI_API_KEY:
+        # Minimal fallback
+        parts = []
+        if weather:
+            w = weather
+            rain = f"{w['rain_mm']} mm" if w.get("rain_mm") is not None else "—"
+            wind = f"{w['wind_kmh']} km/h" if w.get("wind_kmh") is not None else "—"
+            parts.append(f"Cardiff: {w['description']}. Max {w['tmax_c']}°C, min {w['tmin_c']}°C. Rain {rain}. Wind {wind}.")
+        if events:
+            agenda_bits = []
+            for e in events[:5]:
+                when = e["start"] if e["all_day"] else (e["start"] + (f"–{e['end']}" if e["end"] else ""))
+                loc = f" · {e['location']}" if e.get("location") else ""
+                agenda_bits.append(f"{when} — {e['title']}{loc}")
+            parts.append("Today: " + "; ".join(html.escape(x) for x in agenda_bits) + ".")
+        # Headlines: uncertainty placeholder
+        return "<p>" + " ".join(parts) + "</p><p>Top stories: Uncertain · BBC/Guardian/The Times; Uncertain · BBC/Guardian/The Times; Uncertain · BBC/Guardian/The Times.</p>"
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    payload = {
+        "date_local": datetime.now(LONDON_TZ).strftime("%A %d %B %Y"),
+        "location": "Cardiff, UK",
+        "weather": weather,
+        "agenda": events[:6],  # keep short
+    }
+
+    system_msg = (
+        "You are a concise British daily-brief writer. "
+        "Return exactly TWO HTML <p> paragraphs, no other tags. "
+        "Paragraph 1: a warm, direct opener that weaves in Cardiff weather (description, max/min °C, rain mm, wind km/h) "
+        "and a compact view of the day’s agenda (time ranges and titles; at most ~6 items, separated by semicolons). "
+        "Paragraph 2: the top three UK national headlines as short clauses, each with '· Source' (BBC News, The Times, or The Guardian). "
+        "If uncertain about exact titles, write 'Uncertain · BBC/Guardian/The Times' rather than guessing. "
+        "No emojis. British spelling. ~120–180 words total."
+    )
+
+    user_msg = f"DATA (JSON): {json.dumps(payload, ensure_ascii=False)}"
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": system_msg},
+                  {"role": "user", "content": user_msg}],
+        temperature=0.5,
+        top_p=0.9,
+        presence_penalty=0.2,
+        frequency_penalty=0.2,
+        max_tokens=600,
+    )
+    frag = resp.choices[0].message.content.strip()
+    logging.info("GPT response: %s", frag)
+    # Guard: if model returned extra tags, strip to inner <p>…</p>
+    if "<html" in frag.lower() or "<body" in frag.lower():
+        frag = re.sub(r"(?is).*<body[^>]*>(.*)</body>.*", r"\1", frag)
+    # Ensure only <p> tags remain
+    frag = re.sub(r"(?is)\s*(?!<p>)(?!</p>)[^<]+", lambda m: html.escape(m.group(0)), frag)
+    return frag
+
+
+
+
+# ----------------------------
+# EPUB build and email
+# ----------------------------
 
 def build_epub_kindlesafe(html_text: str, out_path: Path) -> Path:
-    # Do not sanitise the full document here; we need <style> to remain in <head>.
+    # Prefer calibre's ebook-convert to produce EPUB2
     if which("ebook-convert"):
         with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as tmp_html:
             tmp_html.write(html_text)
@@ -281,7 +394,6 @@ def build_epub_kindlesafe(html_text: str, out_path: Path) -> Path:
         ]
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # Enforce metadata with calibre if available
             if which("ebook-meta"):
                 subprocess.run(
                     ["ebook-meta", str(out_path), "--title", DOC_TITLE, "--authors", DOC_AUTHOR],
@@ -311,6 +423,7 @@ def build_epub_kindlesafe(html_text: str, out_path: Path) -> Path:
     )
     return out_path
 
+
 def send_mail(send_from, send_to, subject, text, files):
     msg = MIMEMultipart()
     msg["From"] = formataddr((str(Header("", "utf-8")), send_from))
@@ -338,68 +451,76 @@ def send_mail(send_from, send_to, subject, text, files):
     smtp.sendmail(send_from, send_to, msg.as_string())
     smtp.quit()
 
+
+# ----------------------------
+# Main loop
+# ----------------------------
+
 def do_one_round():
-    now = pytz.utc.localize(datetime.now())
+    now = pytz.utc.localize(datetime.utcnow())
     start = get_start(FEED_FILE)
 
-    logging.info(f"Collecting posts since {start}")
-    posts = get_posts_list(load_feeds(), start)
+    # Pull posts (still used for the Articles section)
+    feeds = load_feeds()
+    posts = get_posts_list(feeds, start) if feeds else []
     posts.sort()
-    logging.info(f"Downloaded {len(posts)} posts")
 
+    # Build ChatGPT summary (weather + agenda + top UK headlines)
+    weather_data = fetch_cardiff_weather_data()
+    events = fetch_todays_events_struct()
+    summary_html = build_chatgpt_summary_html(weather_data, events)
+
+    # Build articles HTML from feeds (optional; skip if no posts)
     if posts:
-        # Build summaries
-        headlines_html = build_headlines_section(posts)
-        weather_html = fetch_cardiff_weather_html()
-
-        # Build articles
         articles_html = "\n".join(
             [HTML_PER_POST.format(**nicepost(p, i)) for i, p in enumerate(posts, start=1)]
         )
-
-        # Assemble document
-        html_doc = (
+        body_html = (
             HTML_HEAD
-            + weather_html
-            + "\n"
-            + headlines_html
-            + "\n"
-            + "<h1>Articles</h1>\n"
+            + summary_html
+            + "\n<h1>Articles</h1>\n"
             + articles_html
             + HTML_TAIL
         )
+    else:
+        body_html = HTML_HEAD + summary_html + HTML_TAIL
 
-        logging.info("Creating epub")
-        stamp = datetime.now().strftime("%Y-%m-%d")
-        raw_epub = Path(f"{DOC_TITLE.lower().replace(' ', '')}-{stamp}.epub")
-        final_epub = build_epub_kindlesafe(html_doc, raw_epub)
+    # Create EPUB
+    stamp = datetime.now(LONDON_TZ).strftime("%Y-%m-%d")
+    out_name = f"{DOC_TITLE.lower().replace(' ', '')}-{stamp}.epub"
+    raw_epub = Path(out_name)
+    final_epub = build_epub_kindlesafe(body_html, raw_epub)
 
-        size = final_epub.stat().st_size
-        if not size:
-            logging.error("EPUB is empty; aborting send")
-        elif size > 50 * 1024 * 1024:
-            logging.error("EPUB exceeds 50 MB; aborting send")
-        else:
-            logging.info("Sending to kindle email")
-            send_mail(
-                send_from=EMAIL_FROM,
-                send_to=[KINDLE_EMAIL],
-                subject=DOC_TITLE,
-                text="Your daily news.",
-                files=[str(final_epub)],
-            )
+    size = final_epub.stat().st_size
+    if not size:
+        logging.error("EPUB is empty; aborting send")
+    elif size > 50 * 1024 * 1024:
+        logging.error("EPUB exceeds 50 MB; aborting send")
+    else:
+        logging.info("Sending to Kindle")
+        send_mail(
+            send_from=EMAIL_FROM,
+            send_to=[KINDLE_EMAIL],
+            subject=DOC_TITLE,
+            text="Your daily news.",
+            files=[str(final_epub)],
+        )
+        logging.info("Sent to Kindle")
 
-        logging.info("Cleaning up...")
-        for p in {raw_epub, final_epub}:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
+    # Cleanup
+    for p in {raw_epub, final_epub}:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-    logging.info("Finished.")
+    # Mark timestamp
     update_start(now)
+
 
 if __name__ == "__main__":
     while True:
         do_one_round()
+        # Note: PERIOD was previously hours; here it's minutes for faster iteration.
+        # If you want hours, change to: time.sleep(PERIOD * 60 * 60)
         time.sleep(PERIOD * 60)
